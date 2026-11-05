@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:">
+  <title>NetFix</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main id="app">
+    <header>
+      <h1>NetFix</h1>
+      <p class="muted">Find out what is blocking a site, then work around it.</p>
+    </header>
+
+    <section class="card" aria-labelledby="checkTitle">
+      <div class="row">
+        <h2 id="checkTitle">Connection check</h2>
+        <button id="checkBtn" class="primary">Check</button>
+      </div>
+      <ul id="targets" class="targets"></ul>
+      <p id="summary" class="summary muted">Run a check to see which mode fits your network.</p>
+      <details class="edit">
+        <summary>Edit hosts</summary>
+        <textarea id="targetsInput" rows="3" spellcheck="false" aria-label="Host names, one per line"></textarea>
+        <button id="targetsSave">Save hosts</button>
+      </details>
+    </section>
+
+    <nav class="tabs" role="tablist">
+      <button role="tab" data-tab="dns" id="tab-dns" aria-selected="true">DNS</button>
+      <button role="tab" data-tab="optimize" id="tab-optimize" aria-selected="false">Optimize</button>
+    </nav>
+
+    <section class="card panel" id="panel-dns" role="tabpanel" aria-labelledby="tab-dns">
+      <p class="muted">Changes your DNS to a public resolver with DNS-over-HTTPS. Fixes blocking by DNS. Nothing keeps running; Undo puts your old DNS back.</p>
+      <div class="seg" id="providers" role="radiogroup" aria-label="DNS provider"></div>
+      <p id="dnsState" class="state">Reading current DNS…</p>
+      <div class="row end">
+        <button id="dnsUndo">Undo</button>
+        <button id="dnsApply" class="primary">Apply</button>
+      </div>
+      <p class="hint">Asks for administrator permission each time.</p>
+    </section>
+
+    <section class="card panel" id="panel-optimize" role="tabpanel" aria-labelledby="tab-optimize" hidden>
+      <p class="muted">Runs a local proxy that splits the TLS ClientHello so filters cannot read the site name. Fixes blocking by host name (SNI). Keep the app open while it runs.</p>
+      <dl class="facts">
+        <dt>Status</dt><dd id="optState">Off</dd>
+        <dt>Split</dt><dd id="optStrategy">—</dd>
+        <dt>Traffic</dt><dd id="optStats">—</dd>
+      </dl>
+      <div class="row end">
+        <button id="optMeasure">Find best split</button>
+        <button id="optToggle" class="primary">Start</button>
+      </div>
+      <p class="hint">Covers apps that use the Windows proxy setting (browsers, Steam's store and community pages). Apps that ignore it are not covered.</p>
+    </section>
+
+    <footer id="log" class="log" aria-live="polite"></footer>
+  </main>
+  <script src="renderer.js"></script>
+</body>
+</html>

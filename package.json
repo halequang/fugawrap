@@ -1,0 +1,17 @@
+{
+  "name": "netfix",
+  "productName": "NetFix",
+  "version": "0.1.0",
+  "description": "Diagnose and work around DNS and SNI blocking on Windows: switch DNS with DNS-over-HTTPS, or route HTTPS through a local ClientHello-splitting proxy.",
+  "private": true,
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test \"test/*.test.js\"",
+    "check": "node scripts/live-check.js"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^45.2.3"
+  }
+}
