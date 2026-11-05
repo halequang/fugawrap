@@ -15,7 +15,7 @@ const PROVIDERS = {
   cloudflare: 'Cloudflare',
 };
 
-const STATE_DIR = path.join(process.env.ProgramData || 'C:\\ProgramData', 'NetFix');
+const STATE_DIR = path.join(process.env.ProgramData || 'C:\\ProgramData', 'FugaWrap');
 const STATE_FILE = path.join(STATE_DIR, 'dns-state.json');
 const LOG_FILE = path.join(STATE_DIR, 'dns.log');
 const SCRIPT = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'dns.ps1'), 'utf8');

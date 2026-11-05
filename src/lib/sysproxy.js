@@ -11,9 +11,9 @@ const KEY = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Setti
 
 // Tell running apps the settings changed (INTERNET_OPTION_SETTINGS_CHANGED, _REFRESH).
 const NOTIFY = `
-Add-Type -Namespace NetFix -Name WinInet -MemberDefinition '[DllImport("wininet.dll")] public static extern bool InternetSetOption(System.IntPtr h, int o, System.IntPtr b, int l);'
-[NetFix.WinInet]::InternetSetOption([System.IntPtr]::Zero, 39, [System.IntPtr]::Zero, 0) | Out-Null
-[NetFix.WinInet]::InternetSetOption([System.IntPtr]::Zero, 37, [System.IntPtr]::Zero, 0) | Out-Null`;
+Add-Type -Namespace FugaWrap -Name WinInet -MemberDefinition '[DllImport("wininet.dll")] public static extern bool InternetSetOption(System.IntPtr h, int o, System.IntPtr b, int l);'
+[FugaWrap.WinInet]::InternetSetOption([System.IntPtr]::Zero, 39, [System.IntPtr]::Zero, 0) | Out-Null
+[FugaWrap.WinInet]::InternetSetOption([System.IntPtr]::Zero, 37, [System.IntPtr]::Zero, 0) | Out-Null`;
 
 async function read() {
   const r = await runPs(`

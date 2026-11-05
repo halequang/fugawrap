@@ -1,64 +1,70 @@
 <!doctype html>
-<html lang="en">
+<html lang="vi">
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:">
-  <title>NetFix</title>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost">
+  <title>FugaWrap</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <main id="app">
     <header>
-      <h1>NetFix</h1>
-      <p class="muted">Find out what is blocking a site, then work around it.</p>
+      <img class="logo" src="logo.svg" alt="FunGaming" width="106" height="48">
+      <div class="title">
+        <h1>FugaWrap</h1>
+        <p class="muted" data-i18n="subtitle"></p>
+      </div>
+      <button id="langBtn" class="lang" data-i18n="langSwitch" data-i18n-aria="langSwitchAria"></button>
     </header>
 
     <section class="card" aria-labelledby="checkTitle">
       <div class="row">
-        <h2 id="checkTitle">Connection check</h2>
-        <button id="checkBtn" class="primary">Check</button>
+        <h2 id="checkTitle" data-i18n="checkTitle"></h2>
+        <button id="checkBtn" class="primary" data-i18n="checkBtn"></button>
       </div>
       <ul id="targets" class="targets"></ul>
-      <p id="summary" class="summary muted">Run a check to see which mode fits your network.</p>
+      <p id="summary" class="summary muted" data-i18n="summaryIdle"></p>
       <details class="edit">
-        <summary>Edit hosts</summary>
-        <textarea id="targetsInput" rows="3" spellcheck="false" aria-label="Host names, one per line"></textarea>
-        <button id="targetsSave">Save hosts</button>
+        <summary data-i18n="editHosts"></summary>
+        <textarea id="targetsInput" rows="3" spellcheck="false" data-i18n-aria="hostsAria"></textarea>
+        <button id="targetsSave" data-i18n="saveHosts"></button>
       </details>
     </section>
 
     <nav class="tabs" role="tablist">
-      <button role="tab" data-tab="dns" id="tab-dns" aria-selected="true">DNS</button>
-      <button role="tab" data-tab="optimize" id="tab-optimize" aria-selected="false">Optimize</button>
+      <button role="tab" data-tab="dns" id="tab-dns" aria-selected="true" data-i18n="tabDns"></button>
+      <button role="tab" data-tab="optimize" id="tab-optimize" aria-selected="false" data-i18n="tabOptimize"></button>
     </nav>
 
     <section class="card panel" id="panel-dns" role="tabpanel" aria-labelledby="tab-dns">
-      <p class="muted">Changes your DNS to a public resolver with DNS-over-HTTPS. Fixes blocking by DNS. Nothing keeps running; Undo puts your old DNS back.</p>
-      <div class="seg" id="providers" role="radiogroup" aria-label="DNS provider"></div>
-      <p id="dnsState" class="state">Reading current DNS…</p>
+      <p class="muted" data-i18n="dnsIntro"></p>
+      <div class="seg" id="providers" role="radiogroup" data-i18n-aria="providerAria"></div>
+      <p id="dnsState" class="state" data-i18n="dnsReading"></p>
       <div class="row end">
-        <button id="dnsUndo">Undo</button>
-        <button id="dnsApply" class="primary">Apply</button>
+        <button id="dnsUndo" data-i18n="undo"></button>
+        <button id="dnsApply" class="primary" data-i18n="apply"></button>
       </div>
-      <p class="hint">Asks for administrator permission each time.</p>
+      <p class="hint" data-i18n="dnsHint"></p>
     </section>
 
     <section class="card panel" id="panel-optimize" role="tabpanel" aria-labelledby="tab-optimize" hidden>
-      <p class="muted">Runs a local proxy that splits the TLS ClientHello so filters cannot read the site name. Fixes blocking by host name (SNI). Keep the app open while it runs.</p>
+      <p class="muted" data-i18n="optIntro"></p>
       <dl class="facts">
-        <dt>Status</dt><dd id="optState">Off</dd>
-        <dt>Split</dt><dd id="optStrategy">—</dd>
-        <dt>Traffic</dt><dd id="optStats">—</dd>
+        <dt data-i18n="status"></dt><dd id="optState" data-i18n="off"></dd>
+        <dt data-i18n="split"></dt><dd id="optStrategy">—</dd>
+        <dt data-i18n="traffic"></dt><dd id="optStats">—</dd>
       </dl>
       <div class="row end">
-        <button id="optMeasure">Find best split</button>
-        <button id="optToggle" class="primary">Start</button>
+        <button id="optMeasure" data-i18n="findSplit"></button>
+        <button id="optToggle" class="primary" data-i18n="start"></button>
       </div>
-      <p class="hint">Covers apps that use the Windows proxy setting (browsers, Steam's store and community pages). Apps that ignore it are not covered.</p>
+      <p class="hint" data-i18n="optHint"></p>
     </section>
 
     <footer id="log" class="log" aria-live="polite"></footer>
   </main>
+  <script src="i18n.js"></script>
+  <script src="bridge.js"></script>
   <script src="renderer.js"></script>
 </body>
 </html>

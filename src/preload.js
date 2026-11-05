@@ -8,7 +8,7 @@ const on = (channel) => (fn) => {
   return () => ipcRenderer.off(channel, listener);
 };
 
-contextBridge.exposeInMainWorld('netfix', {
+contextBridge.exposeInMainWorld('fugawrap', {
   getSettings: call('settings:get'),
   setTargets: call('settings:targets'),
   diagnose: call('diagnose'),

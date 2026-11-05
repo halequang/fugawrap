@@ -27,11 +27,17 @@
 }
 
 * { box-sizing: border-box; }
+/* Author display rules (e.g. .card { display: flex }) would otherwise override `hidden`. */
+[hidden] { display: none !important; }
 html, body { margin: 0; background: var(--bg); color: var(--text); }
 body { font: 14px/1.45 "Segoe UI", system-ui, sans-serif; }
 #app { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
 
+header { display: flex; align-items: center; gap: 14px; }
+header .logo { flex: none; height: 48px; width: auto; }
 header h1 { margin: 0; font-size: 20px; }
+header .title { flex: 1; min-width: 0; }
+header .lang { flex: none; align-self: flex-start; padding: 2px 8px; font-size: 12px; }
 h2 { margin: 0; font-size: 15px; }
 p { margin: 0; }
 .muted { color: var(--muted); }
@@ -65,6 +71,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .targets { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .targets li { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; }
 .targets .host { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.targets .badges { display: flex; gap: 4px; }
 .targets .note { grid-column: 1 / -1; color: var(--muted); font-size: 12px; }
 
 .badge { font-size: 12px; padding: 1px 8px; border-radius: 999px; background: var(--chip); color: var(--muted); }
@@ -89,7 +96,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .tabs button { flex: 1; position: relative; }
 .tabs button[aria-selected="true"] { border-color: var(--accent); color: var(--accent); }
 .tabs button.recommended::after {
-  content: "Recommended"; position: absolute; top: -8px; right: 8px;
+  content: attr(data-badge); position: absolute; top: -8px; right: 8px;
   font-size: 10px; padding: 0 6px; border-radius: 999px; background: var(--ok); color: #06231a;
 }
 

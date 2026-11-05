@@ -2,7 +2,7 @@
 # The app prepends: $Mode = 'set' | 'restore'; $Provider = '<key>'.
 # Exit codes: 0 ok, 2 no adapter, 3 nothing to restore, 4 state belongs to another adapter.
 $ErrorActionPreference = 'Continue'
-$Dir   = Join-Path $env:ProgramData 'NetFix'
+$Dir   = Join-Path $env:ProgramData 'FugaWrap'
 $State = Join-Path $Dir 'dns-state.json'
 $Log   = Join-Path $Dir 'dns.log'
 

@@ -1,0 +1,36 @@
+[package]
+name = "fugawrap"
+version = "0.1.0"
+description = "Diagnose and work around DNS and SNI blocking on Windows"
+authors = ["FunGaming (fungamingvn)"]
+license = "MIT"
+edition = "2021"
+
+[lib]
+name = "fugawrap_lib"
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+# TLS handshakes for the connection check. ring needs only the MSVC compiler
+# (aws-lc-rs would also need CMake and NASM).
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+webpki-roots = "1"
+# DNS-over-HTTPS lookups.
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+base64 = "0.22"
+winreg = "0.55"
+windows-sys = { version = "0.59", features = ["Win32_Networking_WinInet"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

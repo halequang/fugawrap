@@ -1,6 +1,6 @@
 {
-  "name": "netfix",
-  "productName": "NetFix",
+  "name": "fugawrap",
+  "productName": "FugaWrap",
   "version": "0.1.0",
   "description": "Diagnose and work around DNS and SNI blocking on Windows: switch DNS with DNS-over-HTTPS, or route HTTPS through a local ClientHello-splitting proxy.",
   "private": true,
@@ -8,10 +8,48 @@
   "scripts": {
     "start": "electron .",
     "test": "node --test \"test/*.test.js\"",
-    "check": "node scripts/live-check.js"
+    "check": "node scripts/live-check.js",
+    "icons": "electron scripts/make-icons.js",
+    "dist": "electron-builder --win portable nsis --x64",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "tauri:test": "cargo test --manifest-path src-tauri/Cargo.toml"
   },
+  "author": "FunGaming (fungamingvn)",
   "license": "MIT",
+  "build": {
+    "appId": "shop.fungamingvn.fugawrap",
+    "productName": "FugaWrap",
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "electronLanguages": [
+      "en-US",
+      "vi"
+    ],
+    "compression": "maximum",
+    "win": {
+      "icon": "build/icon.ico",
+      "artifactName": "${productName}-${version}-${arch}-${target}.${ext}"
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-portable.exe"
+    },
+    "nsis": {
+      "artifactName": "${productName}-${version}-setup.exe",
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  },
   "devDependencies": {
-    "electron": "^45.2.3"
+    "@tauri-apps/cli": "^2.12.4",
+    "electron": "^45.2.3",
+    "electron-builder": "^26.18.0"
   }
 }

@@ -114,7 +114,8 @@ function createWindow() {
     height: 680,
     resizable: false,
     autoHideMenuBar: true,
-    title: 'NetFix',
+    title: 'FugaWrap',
+    icon: path.join(__dirname, 'assets', 'icon.png'),
     backgroundColor: '#0f1115',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),

@@ -1,15 +1,9 @@
 'use strict';
-const api = window.netfix;
+const api = window.fugawrap;
+const { t, translateBackend } = window.i18n;
 const $ = (id) => document.getElementById(id);
 
-const KIND_LABEL = { ok: 'OK', dns: 'DNS block', sni: 'SNI block', ip: 'IP block', run: 'Checking…' };
-const SUMMARY = {
-  null: ['All hosts reachable. No fix needed.', 'ok'],
-  dns: ['Blocked by DNS. Use DNS mode.', 'warn'],
-  sni: ['Blocked by host name (SNI). Use Optimize.', 'warn'],
-  mixed: ['Blocked by host name on some hosts. Use Optimize.', 'warn'],
-  ip: ['Blocked by address. That needs a VPN or tunnel, which this app does not include.', 'bad'],
-};
+const SUMMARY_CLASS = { null: 'ok', dns: 'warn', sni: 'warn', mixed: 'warn', ip: 'bad' };
 
 let settings = null;
 let providers = {};
@@ -17,9 +11,15 @@ let selectedProvider = 'google';
 let dns = null;
 let optimize = null;
 let busy = false;
+// Kept so a language switch can redraw them.
+let results = {};
+let report = null;
+let lastSay = null;
 
+// Footer message. `text` is a function so it re-renders in the current language.
 function say(text, bad = false) {
-  $('log').textContent = text || '';
+  lastSay = text ? { text, bad } : null;
+  $('log').textContent = text ? text() : '';
   $('log').className = 'log' + (bad ? ' bad' : '');
 }
 
@@ -30,7 +30,7 @@ async function act(fn) {
   document.querySelectorAll('button').forEach((b) => { b.disabled = true; });
   try {
     const r = await fn();
-    if (r && r.ok === false) { say(r.error, true); return null; }
+    if (r && r.ok === false) { say(() => translateBackend(r.error), true); return null; }
     return r?.value ?? r;
   } finally {
     busy = false;
@@ -42,31 +42,57 @@ async function act(fn) {
 
 // ---------------------------------------------------------------- check
 
-function targetRow(host, kind, note) {
+function badge(cls, text) {
+  const b = document.createElement('span');
+  b.className = `badge ${cls}`;
+  b.textContent = text;
+  return b;
+}
+
+function targetRow(host, r) {
   const li = document.createElement('li');
   const name = document.createElement('span');
   name.className = 'host';
   name.textContent = host;
-  const badge = document.createElement('span');
-  badge.className = `badge ${kind}`;
-  badge.textContent = KIND_LABEL[kind] || kind;
-  li.append(name, badge);
-  if (note) {
+  const badges = document.createElement('span');
+  badges.className = 'badges';
+  badges.append(r ? badge(r.kind, t(`kind.${r.kind}`)) : badge('idle', '—'));
+  if (r?.viaOptimize === true) badges.append(badge('ok', t('badge.optOk')));
+  if (r?.viaOptimize === false) badges.append(badge('ip', t('badge.optBad')));
+  li.append(name, badges);
+  if (r?.note) {
     const n = document.createElement('span');
     n.className = 'note';
-    n.textContent = note;
+    n.textContent = translateBackend(r.note);
     li.append(n);
   }
   li.dataset.host = host;
   return li;
 }
 
-function renderTargets(results = {}) {
-  $('targets').replaceChildren(...settings.targets.map((h) => {
-    const r = results[h];
-    return r ? targetRow(h, r.kind, r.note) : targetRow(h, 'idle', '');
-  }));
-  document.querySelectorAll('.badge.idle').forEach((b) => { b.textContent = '—'; });
+function renderTargets() {
+  $('targets').replaceChildren(...settings.targets.map((h) => targetRow(h, results[h])));
+}
+
+function optimizeSummary(o) {
+  if (o.working === o.total) return [t('opt.all', o), 'ok'];
+  if (o.working === 0) return [t('opt.none'), 'bad'];
+  return [t('opt.some', o), 'warn'];
+}
+
+function renderSummary() {
+  if (!report) return;
+  let text = t(`sum.${report.kind}`);
+  let cls = SUMMARY_CLASS[report.kind];
+  // While Optimize runs the check also tests through it; then the summary reports
+  // the network's block type plus whether Optimize gets through.
+  if (report.optimize) {
+    const [optText, optCls] = optimizeSummary(report.optimize);
+    text = `${t(`net.${report.kind}`)} ${optText}`;
+    cls = optCls;
+  }
+  $('summary').textContent = text;
+  $('summary').className = `summary ${cls}`;
 }
 
 function recommend(mode) {
@@ -76,28 +102,29 @@ function recommend(mode) {
 }
 
 async function runCheck() {
-  const results = {};
-  settings.targets.forEach((h) => { results[h] = { kind: 'run', note: '' }; });
-  renderTargets(results);
-  $('summary').textContent = 'Checking…';
+  results = {};
+  report = null;
+  settings.targets.forEach((h) => { results[h] = { kind: 'run' }; });
+  renderTargets();
+  $('summary').textContent = t('checking');
   $('summary').className = 'summary muted';
-  const off = api.onProgress((r) => { results[r.host] = r; renderTargets(results); });
-  const report = await act(() => api.diagnose());
+  const off = api.onProgress((r) => { results[r.host] = r; renderTargets(); });
+  const r = await act(() => api.diagnose());
   off();
-  if (!report) return;
-  const [text, cls] = SUMMARY[report.kind];
-  $('summary').textContent = text;
-  $('summary').className = `summary ${cls}`;
+  if (!r) return;
+  report = r;
+  renderSummary();
   recommend(report.recommend);
   if (report.recommend === 'dns' || report.recommend === 'optimize') showTab(report.recommend);
-  const sni = report.targets.find((t) => t.strategy);
-  if (sni) say(`${sni.host}: works with ${describe(sni.strategy)}`);
+  if (optimize?.running) refreshOptimize(); // counters paused while the check ran
+  const sni = report.targets.find((x) => x.strategy);
+  if (sni) say(() => t('worksWith', { host: sni.host, how: describe(sni.strategy) }));
 }
 
 function describe(s) {
-  if (!s) return 'none';
-  const where = s.kind === 'sni' ? 'mid host name' : `after ${s.n} byte${s.n === 1 ? '' : 's'}`;
-  return s.record === false ? `TCP split ${where}` : `record split ${where}`;
+  if (!s) return t('split.none');
+  const where = s.kind === 'sni' ? t('split.mid') : (s.n === 1 ? t('split.after1') : t('split.afterN', { n: s.n }));
+  return t(s.record === false ? 'split.tcp' : 'split.record', { where });
 }
 
 // ---------------------------------------------------------------- tabs
@@ -125,16 +152,15 @@ function renderProviders() {
 
 function renderDns() {
   if (!dns) return;
-  const where = dns.adapter ? ` on ${dns.adapter.name}` : '';
+  const adapter = dns.adapter?.name;
   if (dns.active) {
-    $('dnsState').innerHTML = '';
     const on = document.createElement('span');
     on.className = 'on';
-    on.textContent = `Using ${providers[dns.provider] || dns.provider} with DNS-over-HTTPS${where}.`;
-    $('dnsState').append(on);
+    on.textContent = t(adapter ? 'dns.usingOn' : 'dns.using', { provider: providers[dns.provider] || dns.provider, adapter });
+    $('dnsState').replaceChildren(on);
   } else {
-    const servers = dns.adapter?.servers?.length ? dns.adapter.servers.join(', ') : 'automatic';
-    $('dnsState').textContent = `Network default${where}: ${servers}`;
+    const servers = dns.adapter?.servers?.length ? dns.adapter.servers.join(', ') : t('dns.automatic');
+    $('dnsState').textContent = t(adapter ? 'dns.defaultOn' : 'dns.default', { adapter, servers });
   }
   if (!busy) $('dnsUndo').disabled = !dns.active;
 }
@@ -148,20 +174,35 @@ async function refreshDns() {
 
 function renderOptimize() {
   if (!optimize) return;
-  $('optState').textContent = optimize.running ? `On · 127.0.0.1:${optimize.port}` : 'Off';
+  $('optState').textContent = optimize.running ? t('opt.on', { port: optimize.port }) : t('off');
   $('optState').className = optimize.running ? 'on' : '';
-  $('optStrategy').textContent = optimize.strategyText;
+  $('optStrategy').textContent = describe(optimize.strategy);
   const s = optimize.stats;
-  $('optStats').textContent = s
-    ? `${s.connections} connections, ${s.fragmented} ClientHellos split, ${s.errors} errors`
-    : '—';
-  $('optToggle').textContent = optimize.running ? 'Stop' : 'Start';
+  $('optStats').textContent = s ? t('stats', { c: s.connections, f: s.fragmented, e: s.errors }) : '—';
+  $('optToggle').textContent = optimize.running ? t('stop') : t('start');
 }
 
 async function refreshOptimize() {
   const r = await api.optimizeStatus();
   if (r.ok) { optimize = r.value; renderOptimize(); }
 }
+
+// ---------------------------------------------------------------- language
+
+function renderAll() {
+  window.i18n.apply();
+  document.querySelectorAll('.tabs button').forEach((b) => { b.dataset.badge = t('recommended'); });
+  if (settings) renderTargets();
+  if (report) renderSummary();
+  renderDns();
+  renderOptimize();
+  if (lastSay) say(lastSay.text, lastSay.bad);
+}
+
+$('langBtn').onclick = () => {
+  window.i18n.setLang(window.i18n.lang === 'vi' ? 'en' : 'vi');
+  renderAll();
+};
 
 // ---------------------------------------------------------------- wiring
 
@@ -171,38 +212,42 @@ document.querySelectorAll('.tabs button').forEach((b) => { b.onclick = () => sho
 $('targetsSave').onclick = async () => {
   const list = $('targetsInput').value.split(/\s+/).filter(Boolean);
   const s = await act(() => api.setTargets(list));
-  if (s) { settings = s; $('targetsInput').value = s.targets.join('\n'); renderTargets(); say('Hosts saved'); }
+  if (s) { settings = s; results = {}; $('targetsInput').value = s.targets.join('\n'); renderTargets(); say(() => t('hostsSaved')); }
 };
 
 $('dnsApply').onclick = async () => {
-  say(`Switching DNS to ${providers[selectedProvider]}… approve the Windows prompt.`);
+  const provider = providers[selectedProvider];
+  say(() => t('dns.switching', { provider }));
   const r = await act(() => api.dnsSet(selectedProvider));
-  if (r) { dns = r; say('DNS changed. Run the check again to confirm.'); }
+  if (r) { dns = r; renderDns(); say(() => t('dns.changed')); }
 };
 
 $('dnsUndo').onclick = async () => {
-  say('Restoring your previous DNS… approve the Windows prompt.');
+  say(() => t('dns.restoring'));
   const r = await act(() => api.dnsRestore());
-  if (r) { dns = r; say('Previous DNS restored.'); }
+  if (r) { dns = r; renderDns(); say(() => t('dns.restored')); }
 };
 
 $('optToggle').onclick = async () => {
   const r = await act(() => (optimize?.running ? api.optimizeStop() : api.optimizeStart()));
-  if (r) { optimize = r; say(r.running ? 'Optimize is on. Restart apps that were already open.' : 'Optimize is off.'); }
+  if (r) { optimize = r; renderOptimize(); say(() => t(r.running ? 'opt.started' : 'opt.stopped')); }
 };
 
 $('optMeasure').onclick = async () => {
-  say('Trying each way of splitting the handshake…');
+  say(() => t('measure.trying'));
   const r = await act(() => api.optimizeMeasure());
   if (!r) return;
   optimize = r.status;
-  say(r.strategy ? `Best split: ${r.strategyText}` : (r.error || 'No split got through. The block may be by address.'), !r.strategy);
+  renderOptimize();
+  if (r.strategy) say(() => t('measure.best', { how: describe(r.strategy) }));
+  else say(() => (r.error ? translateBackend(r.error) : t('measure.none')), true);
 };
 
-api.onLog((line) => say(line));
+api.onLog((line) => say(() => translateBackend(line)));
 // Keep the traffic counters current while the proxy runs.
 setInterval(() => { if (optimize?.running && !busy) refreshOptimize(); }, 2000);
 
+renderAll();
 (async () => {
   const r = await api.getSettings();
   settings = r.value.settings;

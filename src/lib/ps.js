@@ -1,10 +1,9 @@
 'use strict';
 // Run PowerShell scripts without writing them to disk.
 //
-// RevoltWarp drops its .ps1 files into C:\ProgramData\RevoltWarp, a folder every
-// local user can write to, then runs them as administrator. Here the script text
-// goes over stdin (normal) or inside -EncodedCommand (elevated), so there is no
-// file another user could swap out.
+// The script text goes over stdin (normal) or inside -EncodedCommand (elevated)
+// instead of into a .ps1 file, so there is no file another local user could swap
+// out before it runs as administrator.
 
 const { spawn } = require('child_process');
 
