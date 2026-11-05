@@ -227,7 +227,10 @@ impl Ctx {
     /// only when the server fails to answer it (reset, close, alert, silence) does
     /// the proxy reconnect and resend it split. The browser has received nothing
     /// from the server yet, so a retry is invisible to it. The plan that worked is
-    /// remembered per host, so a blocked host costs one failed try per session.
+    /// remembered per host and tried first next time, so a blocked host costs one
+    /// failed try per session. It is only a starting point: a split that got
+    /// through once by luck (a filter that drops most TCP splits) falls back to
+    /// the stronger plans after it instead of failing every later connection.
     ///
     /// Returns the upstream socket and the server's first bytes, which the caller
     /// must pass to the client before piping.
@@ -241,14 +244,15 @@ impl Ctx {
         }
         let key = format!("{host}:{port}");
         let remembered = self.fallback.lock().unwrap().get(&key).cloned();
-        let plans = match remembered {
-            Some(plan) => vec![plan],
-            None => plans_for(&hello, self.strategy.read().unwrap().clone()),
-        };
+        let mut plans = plans_for(&hello, self.strategy.read().unwrap().clone());
+        if let Some(start) = remembered.and_then(|r| plans.iter().position(|p| *p == r)) {
+            plans.drain(..start);
+        }
         for (i, plan) in plans.iter().enumerate() {
             if i > 0 {
                 up = self.connect_upstream(&host, port)?;
             }
+            let ip = up.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
             let chunks = fragment(&hello, plan.as_ref());
             if chunks.len() > 1 {
                 self.stats.fragmented.fetch_add(1, Relaxed);
@@ -261,7 +265,7 @@ impl Ctx {
             let rejected = failure.is_some();
             if let Some(why) = &failure {
                 let next = if i + 1 < plans.len() { "retrying" } else { "giving up" };
-                (self.log)(format!("{key}: {} failed ({why}), {next}", label(plan.as_ref())));
+                (self.log)(format!("{key}: {} failed ({why}), {next} [{ip}]", label(plan.as_ref())));
                 if i + 1 < plans.len() {
                     continue;
                 }
@@ -433,6 +437,8 @@ mod tests {
 
     #[derive(Clone, Copy)]
     struct Server {
+        /// From this connection on (0-based), act as if `reassembles` were set.
+        reassembles_from: usize,
         /// Like an SNI filter: drop the connection when the host name is seen
         /// whole, in one TCP read or, with `reassembles`, anywhere in the stream
         /// (only a record split breaks it up then). `silent`: stop answering
@@ -444,7 +450,7 @@ mod tests {
         picky: bool,
     }
 
-    const OPEN: Server = Server { filter: false, reassembles: false, silent: false, picky: false };
+    const OPEN: Server = Server { reassembles_from: usize::MAX, filter: false, reassembles: false, silent: false, picky: false };
 
     /// How one connection's ClientHello arrived and whether it was answered.
     #[derive(Debug, PartialEq)]
@@ -460,8 +466,9 @@ mod tests {
         let port = l.local_addr().unwrap().port();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            for s in l.incoming().flatten() {
+            for (n, s) in l.incoming().flatten().enumerate() {
                 let tx = tx.clone();
+                let reassembles = how.reassembles || n >= how.reassembles_from;
                 thread::spawn(move || {
                     let mut s = s;
                     let (mut got, mut buf, mut whole_host) = (Vec::new(), [0u8; 65536], false);
@@ -478,7 +485,7 @@ mod tests {
                             }
                         }
                     };
-                    whole_host |= how.reassembles && got.windows(host.len()).any(|w| w == host.as_bytes());
+                    whole_host |= reassembles && got.windows(host.len()).any(|w| w == host.as_bytes());
                     let filtered = how.filter && whole_host;
                     let accepted = !filtered && !(how.picky && records > 1);
                     let _ = tx.send(Seen { records, accepted });
@@ -627,6 +634,23 @@ mod tests {
         p.set_strategy(Some(Strategy::sni()));
         tunnel(&p, STEAM, up_port, &hello);
         assert_eq!(seen(&rx).len(), 3, "changing the strategy forgets what was learned");
+        p.stop();
+    }
+
+    #[test]
+    fn a_remembered_split_that_stops_working_falls_back_to_the_next_plan() {
+        let hello = sample_client_hello(STEAM);
+        // The TCP split gets through once, then the filter catches it every time.
+        let (up_port, rx) = tls_server(hello.len(), STEAM, Server { filter: true, reassembles_from: 2, ..OPEN });
+        let (p, log) = logging_proxy(Some(Strategy::sni()));
+
+        tunnel(&p, STEAM, up_port, &hello);
+        assert_eq!(seen(&rx), [NO, Seen { records: 1, accepted: true }], "TCP split learned");
+        tunnel(&p, STEAM, up_port, &hello);
+        assert_eq!(seen(&rx), [NO, Seen { records: 2, accepted: true }], "learned split fails, record split works");
+        tunnel(&p, STEAM, up_port, &hello);
+        assert_eq!(seen(&rx), [Seen { records: 2, accepted: true }], "record split is now remembered");
+        assert!(log.lock().unwrap().iter().any(|m| m.ends_with("using record split mid host name")));
         p.stop();
     }
 

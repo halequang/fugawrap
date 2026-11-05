@@ -411,6 +411,53 @@ mod tests {
         }
     }
 
+    /// Opt-in: `cargo test -- --ignored --nocapture live_resent`. The proxy can
+    /// only resend the browser's one ClientHello, so after an unsplit try is
+    /// filtered the split retry carries the same bytes. Compares that with a fresh
+    /// hello per try, to see whether a filter remembers hellos it has caught.
+    #[test]
+    #[ignore]
+    fn live_resent_hello() {
+        let host = std::env::var("FUGAWRAP_HOST").unwrap_or_else(|_| "cdn.akamai.steamstatic.com".into());
+        let ip = IpAddr::V4(doh::resolve4(&host).unwrap()[0]);
+        let hello = || {
+            let name = ServerName::try_from(host.clone()).unwrap();
+            let mut conn = ClientConnection::new(client_config(), name).unwrap();
+            let mut h = Vec::new();
+            while conn.wants_write() {
+                conn.write_tls(&mut h).unwrap();
+            }
+            h
+        };
+        // Send one hello the given way; "ok" when the server answers with a handshake record.
+        let send = |h: &[u8], s: Option<&Strategy>| -> String {
+            let mut sock = TcpStream::connect_timeout(&SocketAddr::new(ip, 443), TIMEOUT).unwrap();
+            sock.set_nodelay(true).ok();
+            sock.set_read_timeout(Some(TIMEOUT)).ok();
+            write_chunks(&mut sock, &fragment(h, s), GAP).unwrap();
+            let mut b = [0u8; 1];
+            match sock.read(&mut b) {
+                Ok(1) if b[0] == 0x16 => "ok".into(),
+                Ok(0) => "closed".into(),
+                Ok(_) => "alert".into(),
+                Err(e) => io_code(&e),
+            }
+        };
+        let record = Strategy::sni();
+        println!("  {ip}");
+        for (label, same) in [("fresh hello each try", false), ("same hello resent", true)] {
+            let r: Vec<String> = (0..10)
+                .map(|_| {
+                    let h1 = hello();
+                    let first = send(&h1, None);
+                    let h2 = if same { h1 } else { hello() };
+                    format!("{first}>{}", send(&h2, Some(&record)))
+                })
+                .collect();
+            println!("  {label:<22} {}", r.join(" "));
+        }
+    }
+
     /// Live check of the whole Optimize path, opt-in:
     /// `cargo test -- --ignored --nocapture live_`. Starts the real proxy (DoH
     /// resolver, each split method) without touching the system proxy setting.
@@ -438,7 +485,8 @@ mod tests {
 
     /// Live check of many sites through one proxy with the default split, opt-in:
     /// `FUGAWRAP_HOSTS="a.com b.com" cargo test -- --ignored --nocapture live_sites`.
-    /// Each site connects twice: the second one uses whatever the first learned.
+    /// Each site connects FUGAWRAP_ROUNDS times (default 2): later ones use whatever
+    /// the first learned.
     /// Certificates are validated, so a server that serves the wrong one fails.
     #[test]
     #[ignore]
@@ -455,12 +503,13 @@ mod tests {
         )
         .unwrap();
         let port = p.port();
+        let rounds: usize = std::env::var("FUGAWRAP_ROUNDS").ok().and_then(|r| r.parse().ok()).unwrap_or(2);
         let threads: Vec<_> = hosts
             .split_whitespace()
             .map(|h| {
                 let h = h.to_string();
                 std::thread::spawn(move || {
-                    let r: Vec<String> = (0..2)
+                    let r: Vec<String> = (0..rounds)
                         .map(|_| {
                             let o = proxy_probe(port, &h, Duration::from_secs(20));
                             if o.ok { format!("ok {}ms", o.ms) } else { o.error.unwrap_or_default() }
