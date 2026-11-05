@@ -4,9 +4,9 @@
 //! needs a driver. A proxy needs nothing installed and covers every app that uses
 //! the system proxy setting; apps that ignore it are not covered.
 
-use crate::tls::{describe, fragment, is_client_hello, record_length, write_chunks, Strategy, GAP};
+use crate::tls::{client_hello, describe, fragment, is_client_hello, record_length, write_chunks, Strategy, GAP};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -99,6 +99,10 @@ struct Ctx {
     /// "host:port" -> the split that host accepted after it rejected the main one
     /// (`None`: no split). Cleared when the strategy changes.
     fallback: Mutex<Learned>,
+    /// Hosts a probe found reachable without a split (this session only).
+    unblocked: Mutex<HashSet<String>>,
+    /// One probe per new host at a time; other connections wait for its result.
+    probing: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     on_learn: RwLock<Option<LearnFn>>,
     stats: Stats,
     log: LogFn,
@@ -122,6 +126,8 @@ impl FragProxy {
             resolve,
             strategy: RwLock::new(strategy),
             fallback: Mutex::new(HashMap::new()),
+            unblocked: Mutex::new(HashSet::new()),
+            probing: Mutex::new(HashMap::new()),
             on_learn: RwLock::new(None),
             stats: Stats::default(),
             log,
@@ -161,6 +167,7 @@ impl FragProxy {
     pub fn set_strategy(&self, s: Option<Strategy>) {
         *self.ctx.strategy.write().unwrap() = s;
         self.ctx.fallback.lock().unwrap().clear();
+        self.ctx.unblocked.lock().unwrap().clear();
         self.ctx.learned_changed();
     }
 
@@ -264,11 +271,7 @@ impl Ctx {
             return Ok((up, Vec::new()));
         }
         let key = format!("{host}:{port}");
-        let remembered = self.fallback.lock().unwrap().get(&key).cloned();
-        let mut plans = plans_for(&hello, self.strategy.read().unwrap().clone());
-        if let Some(start) = remembered.and_then(|r| plans.iter().position(|p| *p == r)) {
-            plans.drain(..start);
-        }
+        let plans = self.plans_for_host(&key, &host, port, &hello);
         for (i, plan) in plans.iter().enumerate() {
             if i > 0 {
                 up = self.connect_upstream(&host, port)?;
@@ -331,6 +334,56 @@ impl Ctx {
         up.write_all(out.as_bytes()).map_err(|e| e.to_string())?;
         up.write_all(&head.rest).map_err(|e| e.to_string())?;
         Ok(up)
+    }
+
+    /// The plans to try for this connection, starting with the one known to work.
+    ///
+    /// A filter that has seen a ClientHello unsplit often still resets it when it
+    /// is resent split (about 4 in 10 on Steam's CDNs; never with a fresh hello).
+    /// The proxy can only resend the browser's hello, so for a host it knows
+    /// nothing about it first probes with throwaway hellos of its own: unsplit,
+    /// then each split, and the browser's hello goes out once in the form that
+    /// got through. A host that needs a split is remembered (and saved); one that
+    /// doesn't is remembered for the session.
+    fn plans_for_host(&self, key: &str, host: &str, port: u16, hello: &[u8]) -> Vec<Option<Strategy>> {
+        let mut plans = plans_for(hello, self.strategy.read().unwrap().clone());
+        if plans.len() == 1 {
+            return plans;
+        }
+        let known = |ctx: &Self| -> Option<usize> {
+            if ctx.unblocked.lock().unwrap().contains(key) {
+                return Some(0);
+            }
+            let remembered = ctx.fallback.lock().unwrap().get(key).cloned()?;
+            Some(plans.iter().position(|p| *p == remembered).unwrap_or(0))
+        };
+        let start = known(self).or_else(|| {
+            let gate = self.probing.lock().unwrap().entry(key.to_string()).or_default().clone();
+            let _one_at_a_time = gate.lock().unwrap();
+            known(self).or_else(|| self.probe(key, host, port, &plans))
+        });
+        plans.drain(..start.unwrap_or(0));
+        plans
+    }
+
+    /// Index of the first plan a fresh hello gets through with, remembered.
+    fn probe(&self, key: &str, host: &str, port: u16, plans: &[Option<Strategy>]) -> Option<usize> {
+        let works = |plan: &Option<Strategy>| -> bool {
+            let (Some(hello), Ok(mut up)) = (client_hello(host), self.connect_upstream(host, port)) else { return false };
+            write_chunks(&mut up, &fragment(&hello, plan.as_ref()), GAP).is_ok() && first_reply(&mut up).0.is_none()
+        };
+        let Some(i) = plans.iter().position(works) else {
+            (self.log)(format!("{key}: probe found no working split"));
+            return None;
+        };
+        if i == 0 {
+            self.unblocked.lock().unwrap().insert(key.to_string());
+        } else {
+            (self.log)(format!("{key}: blocked by host name, using {}", label(plans[i].as_ref())));
+            self.fallback.lock().unwrap().insert(key.to_string(), plans[i].clone());
+            self.learned_changed();
+        }
+        Some(i)
     }
 
     fn learned_changed(&self) {
@@ -473,8 +526,6 @@ mod tests {
 
     #[derive(Clone, Copy)]
     struct Server {
-        /// From this connection on (0-based), act as if `reassembles` were set.
-        reassembles_from: usize,
         /// Like an SNI filter: drop the connection when the host name is seen
         /// whole, in one TCP read or, with `reassembles`, anywhere in the stream
         /// (only a record split breaks it up then). `silent`: stop answering
@@ -486,7 +537,7 @@ mod tests {
         picky: bool,
     }
 
-    const OPEN: Server = Server { reassembles_from: usize::MAX, filter: false, reassembles: false, silent: false, picky: false };
+    const OPEN: Server = Server { filter: false, reassembles: false, silent: false, picky: false };
 
     /// How one connection's ClientHello arrived and whether it was answered.
     #[derive(Debug, PartialEq)]
@@ -502,9 +553,8 @@ mod tests {
         let port = l.local_addr().unwrap().port();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            for (n, s) in l.incoming().flatten().enumerate() {
+            for s in l.incoming().flatten() {
                 let tx = tx.clone();
-                let reassembles = how.reassembles || n >= how.reassembles_from;
                 thread::spawn(move || {
                     let mut s = s;
                     let (mut got, mut buf, mut whole_host) = (Vec::new(), [0u8; 65536], false);
@@ -521,7 +571,7 @@ mod tests {
                             }
                         }
                     };
-                    whole_host |= reassembles && got.windows(host.len()).any(|w| w == host.as_bytes());
+                    whole_host |= how.reassembles && got.windows(host.len()).any(|w| w == host.as_bytes());
                     let filtered = how.filter && whole_host;
                     let accepted = !filtered && !(how.picky && records > 1);
                     let _ = tx.send(Seen { records, accepted });
@@ -631,7 +681,9 @@ mod tests {
         let (up_port, rx) = tls_server(hello.len(), "www.xbox.com", OPEN);
         let p = proxy(local(), Some(Strategy::sni()));
         tunnel(&p, "www.xbox.com", up_port, &hello);
-        assert_eq!(seen(&rx), [Seen { records: 1, accepted: true }]);
+        assert_eq!(seen(&rx), [Seen { records: 1, accepted: true }, Seen { records: 1, accepted: true }], "probe, then the browser's hello, both unsplit");
+        tunnel(&p, "www.xbox.com", up_port, &hello);
+        assert_eq!(seen(&rx), [Seen { records: 1, accepted: true }], "no second probe");
         assert_eq!(p.stats().fragmented, 0);
         p.stop();
     }
@@ -640,17 +692,17 @@ mod tests {
     const NO: Seen = Seen { records: 1, accepted: false };
 
     #[test]
-    fn blocked_host_gets_a_tcp_split_first_and_it_is_remembered() {
+    fn a_probe_finds_the_tcp_split_and_the_browser_hello_is_sent_once() {
         let hello = sample_client_hello(STEAM);
         let (up_port, rx) = tls_server(hello.len(), STEAM, Server { filter: true, ..OPEN });
         let (p, log) = logging_proxy(Some(Strategy::sni()));
 
         tunnel(&p, STEAM, up_port, &hello);
-        assert_eq!(seen(&rx), [NO, Seen { records: 1, accepted: true }], "unsplit filtered, TCP split passes");
+        assert_eq!(seen(&rx), [NO, Seen { records: 1, accepted: true }, Seen { records: 1, accepted: true }], "probes: unsplit filtered, TCP split passes; then the browser's hello");
         tunnel(&p, STEAM, up_port, &hello);
         assert_eq!(seen(&rx), [Seen { records: 1, accepted: true }], "second time: straight to the TCP split");
         assert_eq!(p.stats().fragmented, 2);
-        assert!(log.lock().unwrap().iter().any(|m| m.ends_with("using TCP split mid host name")));
+        assert!(log.lock().unwrap().iter().any(|m| m.ends_with("blocked by host name, using TCP split mid host name")));
         p.stop();
     }
 
@@ -662,26 +714,26 @@ mod tests {
         let (p, log) = logging_proxy(Some(Strategy::sni()));
 
         tunnel(&p, STEAM, up_port, &hello);
-        assert_eq!(seen(&rx), [NO, NO, Seen { records: 2, accepted: true }]);
+        assert_eq!(seen(&rx), [NO, NO, Seen { records: 2, accepted: true }, Seen { records: 2, accepted: true }], "the browser's hello is only sent split");
         tunnel(&p, STEAM, up_port, &hello);
         assert_eq!(seen(&rx), [Seen { records: 2, accepted: true }]);
         assert!(log.lock().unwrap().iter().any(|m| m.ends_with("using record split mid host name")));
 
         p.set_strategy(Some(Strategy::sni()));
         tunnel(&p, STEAM, up_port, &hello);
-        assert_eq!(seen(&rx).len(), 3, "changing the strategy forgets what was learned");
+        assert_eq!(seen(&rx).len(), 4, "changing the strategy forgets what was learned");
         p.stop();
     }
 
     #[test]
     fn a_remembered_split_that_stops_working_falls_back_to_the_next_plan() {
         let hello = sample_client_hello(STEAM);
-        // The TCP split gets through once, then the filter catches it every time.
-        let (up_port, rx) = tls_server(hello.len(), STEAM, Server { filter: true, reassembles_from: 2, ..OPEN });
+        // Learned the TCP split earlier, but the filter now catches it.
+        let (up_port, rx) = tls_server(hello.len(), STEAM, Server { filter: true, reassembles: true, ..OPEN });
         let (p, log) = logging_proxy(Some(Strategy::sni()));
+        let tcp = Strategy { record: Some(false), ..Strategy::sni() };
+        p.learn(HashMap::from([(format!("{STEAM}:{up_port}"), Some(tcp))]));
 
-        tunnel(&p, STEAM, up_port, &hello);
-        assert_eq!(seen(&rx), [NO, Seen { records: 1, accepted: true }], "TCP split learned");
         tunnel(&p, STEAM, up_port, &hello);
         assert_eq!(seen(&rx), [NO, Seen { records: 2, accepted: true }], "learned split fails, record split works");
         tunnel(&p, STEAM, up_port, &hello);
@@ -714,8 +766,8 @@ mod tests {
         let (up_port, rx) = tls_server(hello.len(), STEAM, Server { filter: true, silent: true, ..OPEN });
         let (p, log) = logging_proxy(Some(Strategy::sni()));
         tunnel(&p, STEAM, up_port, &hello);
-        assert_eq!(seen(&rx), [NO, Seen { records: 1, accepted: true }]);
-        assert!(log.lock().unwrap().iter().any(|m| m.contains("no split failed (no answer)")));
+        assert_eq!(seen(&rx), [NO, Seen { records: 1, accepted: true }, Seen { records: 1, accepted: true }]);
+        assert!(log.lock().unwrap().iter().any(|m| m.ends_with("blocked by host name, using TCP split mid host name")));
         p.stop();
     }
 
@@ -731,7 +783,9 @@ mod tests {
         assert!(reply_head(&mut c).starts_with("HTTP/1.1 200"));
         c.write_all(&hello).unwrap();
         assert_eq!(read_exact_n(&mut c, DECODE_ERROR.len()), DECODE_ERROR, "the browser sees the server's alert");
-        assert_eq!(seen(&rx), [NO, NO, Seen { records: 2, accepted: false }]);
+        let rejected = Seen { records: 2, accepted: false };
+        let rejected2 = Seen { records: 2, accepted: false };
+        assert_eq!(seen(&rx), [NO, NO, rejected, NO, NO, rejected2], "probes, then the browser's hello every way");
         let log = log.lock().unwrap().join("\n");
         assert!(log.contains("record split mid host name failed (alert 50), giving up"), "{log}");
         assert!(!log.contains("using"), "nothing remembered: {log}");

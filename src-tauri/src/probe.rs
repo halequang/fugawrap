@@ -444,17 +444,37 @@ mod tests {
             }
         };
         let record = Strategy::sni();
+        let tcp = Strategy { record: Some(false), ..Strategy::sni() };
         println!("  {ip}");
-        for (label, same) in [("fresh hello each try", false), ("same hello resent", true)] {
-            let r: Vec<String> = (0..10)
-                .map(|_| {
-                    let h1 = hello();
-                    let first = send(&h1, None);
-                    let h2 = if same { h1 } else { hello() };
-                    format!("{first}>{}", send(&h2, Some(&record)))
-                })
-                .collect();
-            println!("  {label:<22} {}", r.join(" "));
+        let rounds: usize = std::env::var("FUGAWRAP_ROUNDS").ok().and_then(|r| r.parse().ok()).unwrap_or(10);
+        // (label, earlier tries of the same hello, pause before the record split)
+        let cases: [(&str, Vec<Option<&Strategy>>, u64); 5] = [
+            ("fresh: none>record", vec![], 0),
+            ("same: none>record", vec![None], 0),
+            ("same: none>tcp>record", vec![None, Some(&tcp)], 0),
+            ("same: none>tcp>1s>record", vec![None, Some(&tcp)], 1000),
+            ("same: none>tcp>3s>record", vec![None, Some(&tcp)], 3000),
+        ];
+        for (label, before, pause) in cases {
+            let mut fails = 0;
+            for _ in 0..rounds {
+                let h = hello();
+                if before.is_empty() {
+                    send(&h, None);
+                    if send(&hello(), Some(&record)) != "ok" {
+                        fails += 1;
+                    }
+                    continue;
+                }
+                for s in &before {
+                    send(&h, *s);
+                }
+                std::thread::sleep(Duration::from_millis(pause));
+                if send(&h, Some(&record)) != "ok" {
+                    fails += 1;
+                }
+            }
+            println!("  {label:<26} {fails}/{rounds} record splits failed");
         }
     }
 

@@ -181,16 +181,20 @@ pub fn write_chunks<W: Write>(w: &mut W, chunks: &[Vec<u8>], gap: Duration) -> i
     Ok(())
 }
 
-/// A real ClientHello, as rustls would send it to `host`.
-#[cfg(test)]
-pub fn sample_client_hello(host: &str) -> Vec<u8> {
-    let name = rustls::pki_types::ServerName::try_from(host.to_owned()).unwrap();
-    let mut conn = rustls::ClientConnection::new(crate::probe::client_config(), name).unwrap();
+/// A fresh ClientHello, as rustls would send it to `host`.
+pub fn client_hello(host: &str) -> Option<Vec<u8>> {
+    let name = rustls::pki_types::ServerName::try_from(host.to_owned()).ok()?;
+    let mut conn = rustls::ClientConnection::new(crate::probe::client_config(), name).ok()?;
     let mut out = Vec::new();
     while conn.wants_write() {
-        conn.write_tls(&mut out).unwrap();
+        conn.write_tls(&mut out).ok()?;
     }
-    out
+    Some(out)
+}
+
+#[cfg(test)]
+pub fn sample_client_hello(host: &str) -> Vec<u8> {
+    client_hello(host).unwrap()
 }
 
 /// Parse a byte stream into (content type, payload) TLS records.
