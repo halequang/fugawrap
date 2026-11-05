@@ -13,9 +13,10 @@ mod settings;
 mod sysproxy;
 mod tls;
 
-use proxy::{FragProxy, LogFn, ResolveFn, StatsView};
-use serde::Serialize;
+use proxy::{FragProxy, Learned, LogFn, ResolveFn, StatsView};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
@@ -25,6 +26,44 @@ struct AppState {
     settings: settings::Store,
     sysproxy: sysproxy::SysProxy,
     proxy: Mutex<Option<FragProxy>>,
+    learned_path: PathBuf,
+}
+
+// ---------------------------------------------------------------- learned splits
+
+/// Splits the proxy learned per host, kept across sessions. Only valid for the
+/// main strategy they were learned with.
+#[derive(Serialize, Deserialize, Default)]
+struct LearnedFile {
+    strategy: Option<Strategy>,
+    hosts: Learned,
+}
+
+fn load_learned(path: &Path, strategy: Option<&Strategy>) -> Learned {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<LearnedFile>(&t).ok())
+        .filter(|f| f.strategy.as_ref() == strategy)
+        .map(|f| f.hosts)
+        .unwrap_or_default()
+}
+
+fn save_learned(path: &Path, strategy: Option<&Strategy>, hosts: &Learned) {
+    let file = LearnedFile { strategy: strategy.cloned(), hosts: hosts.clone() };
+    if let Ok(json) = serde_json::to_string_pretty(&file) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// Hosts the check found blocked by name, with the split the proxy should start with.
+fn learned_from_check(report: &probe::Report, strategy: Option<&Strategy>) -> Learned {
+    report
+        .targets
+        .iter()
+        .filter(|t| t.kind == "sni")
+        .filter_map(|t| Some((format!("{}:443", t.host), proxy::plan_for_check(strategy, t.strategy.as_ref()?)?)))
+        .map(|(k, plan)| (k, Some(plan)))
+        .collect()
 }
 
 type CmdResult<T> = Result<T, String>;
@@ -62,7 +101,21 @@ async fn diagnose(app: AppHandle) -> CmdResult<probe::Report> {
     let targets = state.settings.get().targets;
     // While Optimize runs, also test the path through it.
     let via_proxy = state.proxy.lock().unwrap().as_ref().map(FragProxy::port);
-    blocking(move || probe::diagnose(&targets, via_proxy, |r| { let _ = app.emit("diagnose:progress", r); })).await
+    let a = app.clone();
+    let report = blocking(move || probe::diagnose(&targets, via_proxy, |r| { let _ = a.emit("diagnose:progress", r); })).await?;
+    // Let Optimize start blocked hosts with the split straight away.
+    let strategy = state.settings.get().strategy;
+    let seeds = learned_from_check(&report, strategy.as_ref());
+    match state.proxy.lock().unwrap().as_ref() {
+        Some(p) => p.learn(seeds),
+        None if !seeds.is_empty() => {
+            let mut hosts = load_learned(&state.learned_path, strategy.as_ref());
+            hosts.extend(seeds);
+            save_learned(&state.learned_path, strategy.as_ref(), &hosts);
+        }
+        None => {}
+    }
+    Ok(report)
 }
 
 // ---------------------------------------------------------------- dns
@@ -126,6 +179,9 @@ fn start_optimize(app: &AppHandle, state: &AppState) -> CmdResult<()> {
             e.to_string()
         }
     })?;
+    p.learn(load_learned(&state.learned_path, s.strategy.as_ref()));
+    let path = state.learned_path.clone();
+    p.on_learn(Arc::new(move |strategy, hosts| save_learned(&path, strategy, hosts)));
     if let Err(e) = state.sysproxy.enable(p.port()) {
         p.stop();
         let _ = state.sysproxy.restore();
@@ -214,7 +270,8 @@ pub fn run() {
                 Ok(None) => {}
                 Err(e) => eprintln!("proxy recovery failed: {e}"),
             }
-            app.manage(AppState { settings, sysproxy, proxy: Mutex::new(None) });
+            let learned_path = dir.join("proxy-learned.json");
+            app.manage(AppState { settings, sysproxy, proxy: Mutex::new(None), learned_path });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

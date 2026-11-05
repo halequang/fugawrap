@@ -26,6 +26,10 @@ const ALERT: u8 = 0x15;
 
 pub type ResolveFn = Arc<dyn Fn(&str) -> io::Result<IpAddr> + Send + Sync>;
 pub type LogFn = Arc<dyn Fn(String) + Send + Sync>;
+/// "host:port" -> the split that host needs (`None`: no split).
+pub type Learned = HashMap<String, Option<Strategy>>;
+/// Called with the main strategy and everything learned, each time it changes.
+pub type LearnFn = Arc<dyn Fn(Option<&Strategy>, &Learned) + Send + Sync>;
 
 #[derive(Default)]
 pub struct Stats {
@@ -94,7 +98,8 @@ struct Ctx {
     strategy: RwLock<Option<Strategy>>,
     /// "host:port" -> the split that host accepted after it rejected the main one
     /// (`None`: no split). Cleared when the strategy changes.
-    fallback: Mutex<HashMap<String, Option<Strategy>>>,
+    fallback: Mutex<Learned>,
+    on_learn: RwLock<Option<LearnFn>>,
     stats: Stats,
     log: LogFn,
     live: Mutex<HashMap<u64, TcpStream>>,
@@ -117,6 +122,7 @@ impl FragProxy {
             resolve,
             strategy: RwLock::new(strategy),
             fallback: Mutex::new(HashMap::new()),
+            on_learn: RwLock::new(None),
             stats: Stats::default(),
             log,
             live: Mutex::new(HashMap::new()),
@@ -155,6 +161,21 @@ impl FragProxy {
     pub fn set_strategy(&self, s: Option<Strategy>) {
         *self.ctx.strategy.write().unwrap() = s;
         self.ctx.fallback.lock().unwrap().clear();
+        self.ctx.learned_changed();
+    }
+
+    /// Start from splits learned earlier (a previous session, the connection
+    /// check), so the first connection to a blocked host doesn't go out unsplit.
+    pub fn learn(&self, hosts: Learned) {
+        if hosts.is_empty() {
+            return;
+        }
+        self.ctx.fallback.lock().unwrap().extend(hosts);
+        self.ctx.learned_changed();
+    }
+
+    pub fn on_learn(&self, f: LearnFn) {
+        *self.ctx.on_learn.write().unwrap() = Some(f);
     }
 
     pub fn stop(mut self) {
@@ -273,6 +294,7 @@ impl Ctx {
             if i > 0 && !rejected {
                 (self.log)(format!("{key}: using {}", label(plan.as_ref())));
                 self.fallback.lock().unwrap().insert(key, plan.clone());
+                self.learned_changed();
             }
             return Ok((up, reply));
         }
@@ -311,6 +333,12 @@ impl Ctx {
         Ok(up)
     }
 
+    fn learned_changed(&self) {
+        let Some(f) = self.on_learn.read().unwrap().clone() else { return };
+        let learned = self.fallback.lock().unwrap().clone();
+        f(self.strategy.read().unwrap().as_ref(), &learned);
+    }
+
     fn track(&self, s: &TcpStream) -> Option<u64> {
         let id = self.next_id.fetch_add(1, Relaxed);
         self.live.lock().unwrap().insert(id, s.try_clone().ok()?);
@@ -346,6 +374,14 @@ fn label(plan: Option<&Strategy>) -> String {
         Some(s) => describe(Some(s)),
         None => "no split".into(),
     }
+}
+
+/// The proxy plan matching a split the connection check found working, for a
+/// proxy whose main strategy is `main`. Same split point as the proxy uses, kept
+/// as a TCP-only split if that is what the check needed.
+pub fn plan_for_check(main: Option<&Strategy>, found: &Strategy) -> Option<Strategy> {
+    let main = main?.clone();
+    Some(if found.record == Some(false) { Strategy { record: Some(false), ..main } } else { Strategy { record: None, ..main } })
 }
 
 /// What to try, in order, for one ClientHello, safest first: unsplit; then the
@@ -651,6 +687,24 @@ mod tests {
         tunnel(&p, STEAM, up_port, &hello);
         assert_eq!(seen(&rx), [Seen { records: 2, accepted: true }], "record split is now remembered");
         assert!(log.lock().unwrap().iter().any(|m| m.ends_with("using record split mid host name")));
+        p.stop();
+    }
+
+    #[test]
+    fn a_learned_host_skips_the_unsplit_try_and_new_lessons_are_reported() {
+        let hello = sample_client_hello(STEAM);
+        let filter = Server { filter: true, reassembles: true, ..OPEN };
+        let (up_port, rx) = tls_server(hello.len(), STEAM, filter);
+        let (p, _) = logging_proxy(Some(Strategy::sni()));
+        let reported = Arc::new(Mutex::new(Vec::<Learned>::new()));
+        let sink = reported.clone();
+        p.on_learn(Arc::new(move |_, l| sink.lock().unwrap().push(l.clone())));
+
+        let key = format!("{STEAM}:{up_port}");
+        p.learn(HashMap::from([(key.clone(), plan_for_check(Some(&Strategy::sni()), &Strategy::sni()))]));
+        tunnel(&p, STEAM, up_port, &hello);
+        assert_eq!(seen(&rx), [Seen { records: 2, accepted: true }], "first connection goes straight to the record split");
+        assert_eq!(reported.lock().unwrap().last().unwrap()[&key], Some(Strategy::sni()));
         p.stop();
     }
 
