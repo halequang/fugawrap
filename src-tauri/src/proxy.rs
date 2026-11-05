@@ -18,9 +18,10 @@ const MAX_HEAD: usize = 16 * 1024;
 const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
 const HELLO_WAIT: Duration = Duration::from_secs(1);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long to wait for the server's answer to a split ClientHello before
-/// assuming it was accepted. Servers answer within one round trip.
-const FIRST_REPLY_WAIT: Duration = Duration::from_secs(5);
+/// How long to wait for the server's answer to a ClientHello before trying the
+/// next plan. Servers answer within one round trip; a filter that drops packets,
+/// or a server that hangs on a split hello (login.live.com), never answers.
+const FIRST_REPLY_WAIT: Duration = if cfg!(test) { Duration::from_millis(500) } else { Duration::from_secs(5) };
 const ALERT: u8 = 0x15;
 
 pub type ResolveFn = Arc<dyn Fn(&str) -> io::Result<IpAddr> + Send + Sync>;
@@ -215,14 +216,18 @@ impl Ctx {
         Ok(up)
     }
 
-    /// CONNECT host:443: answer 200, then send the first ClientHello split.
+    /// CONNECT host:443: answer 200, then forward the first ClientHello, split only
+    /// if the host needs it.
     ///
-    /// Some servers refuse a ClientHello spread over two TLS records, although
-    /// RFC 8446 requires them to accept it (id.plaync.com answers decode_error).
-    /// When a server answers the record split with an alert or by closing, this
-    /// reconnects and resends the same ClientHello with a TCP-only split, then
-    /// unsplit. The browser has received nothing from the server yet, so the retry
-    /// is invisible to it. The split that worked is remembered per host.
+    /// Splitting is not free. Some servers break on a ClientHello spread over two
+    /// TLS records, although RFC 8446 requires them to accept it: plaync.com
+    /// answers decode_error or resets, login.live.com never answers, and xbox.com
+    /// cannot read the host name and serves the wrong certificate, which the proxy
+    /// cannot see (TLS 1.3 encrypts it). So the hello goes out unsplit first, and
+    /// only when the server fails to answer it (reset, close, alert, silence) does
+    /// the proxy reconnect and resend it split. The browser has received nothing
+    /// from the server yet, so a retry is invisible to it. The plan that worked is
+    /// remembered per host, so a blocked host costs one failed try per session.
     ///
     /// Returns the upstream socket and the server's first bytes, which the caller
     /// must pass to the client before piping.
@@ -252,13 +257,17 @@ impl Ctx {
             if plans.len() == 1 {
                 return Ok((up, Vec::new()));
             }
-            let (rejected, reply) = first_reply(&mut up);
-            if rejected && i + 1 < plans.len() {
-                (self.log)(format!("{key} rejected {}, retrying", describe(plan.as_ref())));
-                continue;
+            let (failure, reply) = first_reply(&mut up);
+            let rejected = failure.is_some();
+            if let Some(why) = &failure {
+                let next = if i + 1 < plans.len() { "retrying" } else { "giving up" };
+                (self.log)(format!("{key}: {} failed ({why}), {next}", label(plan.as_ref())));
+                if i + 1 < plans.len() {
+                    continue;
+                }
             }
             if i > 0 && !rejected {
-                (self.log)(format!("{key}: using {}", describe(plan.as_ref())));
+                (self.log)(format!("{key}: using {}", label(plan.as_ref())));
                 self.fallback.lock().unwrap().insert(key, plan.clone());
             }
             return Ok((up, reply));
@@ -328,29 +337,46 @@ impl Ctx {
     }
 }
 
-/// What to try, in order, for one ClientHello. Fallbacks only exist for a record
-/// split: a TCP split at the same place, then no split.
-fn plans_for(hello: &[u8], main: Option<Strategy>) -> Vec<Option<Strategy>> {
-    match main {
-        Some(s) if is_client_hello(hello) && s.record != Some(false) => {
-            let tcp = Strategy { record: Some(false), ..s.clone() };
-            vec![Some(s), Some(tcp), None]
-        }
-        other => vec![other],
+fn label(plan: Option<&Strategy>) -> String {
+    match plan {
+        Some(s) => describe(Some(s)),
+        None => "no split".into(),
     }
 }
 
-/// Wait for the server's first answer. `rejected` when it is a TLS alert, or the
-/// server closed or reset the connection without answering. A timeout counts as
-/// accepted (nothing is lost: the client's bytes wait in the socket buffer).
-fn first_reply(up: &mut TcpStream) -> (bool, Vec<u8>) {
+/// What to try, in order, for one ClientHello, safest first: unsplit; then the
+/// chosen split point as a TCP-only split, which keeps one TLS record so every
+/// server reads it like an unsplit hello; then as a record split, which gets past
+/// filters that reassemble TCP but which some servers mishandle (see open_tunnel).
+fn plans_for(hello: &[u8], main: Option<Strategy>) -> Vec<Option<Strategy>> {
+    match main {
+        Some(s) if is_client_hello(hello) => {
+            let tcp = Strategy { record: Some(false), ..s.clone() };
+            let record = Strategy { record: None, ..s };
+            vec![None, Some(tcp), Some(record)]
+        }
+        _ => vec![None],
+    }
+}
+
+/// Wait for the server's first answer. Returns why it failed when it is a TLS
+/// alert, the server closed or reset the connection, or it said nothing for
+/// FIRST_REPLY_WAIT; the client's bytes meanwhile wait in its socket buffer.
+/// The bytes read are returned either way.
+fn first_reply(up: &mut TcpStream) -> (Option<String>, Vec<u8>) {
     let _ = up.set_read_timeout(Some(FIRST_REPLY_WAIT));
     let mut buf = vec![0u8; 16 * 1024];
     let result = match up.read(&mut buf) {
-        Ok(0) => (true, Vec::new()),
-        Ok(n) => (buf[0] == ALERT, buf[..n].to_vec()),
-        Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => (false, Vec::new()),
-        Err(_) => (true, Vec::new()),
+        Ok(0) => (Some("closed".into()), Vec::new()),
+        Ok(n) if buf[0] == ALERT => {
+            let desc = if n >= 7 { format!("alert {}", buf[6]) } else { "alert".into() };
+            (Some(desc), buf[..n].to_vec())
+        }
+        Ok(n) => (None, buf[..n].to_vec()),
+        Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+            (Some("no answer".into()), Vec::new())
+        }
+        Err(e) => (Some(format!("{:?}", e.kind())), Vec::new()),
     };
     let _ = up.set_read_timeout(None);
     result
@@ -383,8 +409,7 @@ mod tests {
     const SERVER_HELLO: [u8; 6] = [0x16, 0x03, 0x03, 0x00, 0x01, 0x02];
     const DECODE_ERROR: [u8; 7] = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x32];
 
-    /// Fake upstream that reports every read it gets, and answers the first one
-    /// the way a server answers a ClientHello.
+    /// Fake upstream for plain HTTP: reports every read it gets.
     fn upstream() -> (u16, mpsc::Receiver<Vec<u8>>) {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
@@ -395,13 +420,9 @@ mod tests {
                 thread::spawn(move || {
                     let mut s = s;
                     let mut buf = [0u8; 65536];
-                    let mut first = true;
                     while let Ok(n) = s.read(&mut buf) {
                         if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
                             break;
-                        }
-                        if std::mem::take(&mut first) && buf[0] == 0x16 {
-                            let _ = s.write_all(&SERVER_HELLO);
                         }
                     }
                 });
@@ -410,10 +431,31 @@ mod tests {
         (port, rx)
     }
 
-    /// Fake server like id.plaync.com: answers decode_error and closes when the
-    /// ClientHello comes in more than one record. Reports how each connection's
-    /// hello arrived (number of records).
-    fn picky_upstream(hello_len: usize) -> (u16, mpsc::Receiver<usize>) {
+    #[derive(Clone, Copy)]
+    struct Server {
+        /// Like an SNI filter: drop the connection when the host name is seen
+        /// whole, in one TCP read or, with `reassembles`, anywhere in the stream
+        /// (only a record split breaks it up then). `silent`: stop answering
+        /// instead of closing, as a packet drop would.
+        filter: bool,
+        reassembles: bool,
+        silent: bool,
+        /// Like id.plaync.com: answer decode_error to a hello in several records.
+        picky: bool,
+    }
+
+    const OPEN: Server = Server { filter: false, reassembles: false, silent: false, picky: false };
+
+    /// How one connection's ClientHello arrived and whether it was answered.
+    #[derive(Debug, PartialEq)]
+    struct Seen {
+        records: usize,
+        accepted: bool,
+    }
+
+    /// Fake TLS server. Answers an accepted ClientHello with SERVER_HELLO, then
+    /// echoes everything back. Reports a `Seen` per connection.
+    fn tls_server(hello_len: usize, host: &'static str, how: Server) -> (u16, mpsc::Receiver<Seen>) {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
         let (tx, rx) = mpsc::channel();
@@ -422,28 +464,71 @@ mod tests {
                 let tx = tx.clone();
                 thread::spawn(move || {
                     let mut s = s;
-                    let (mut got, mut buf) = (Vec::new(), [0u8; 65536]);
-                    let recs = loop {
+                    let (mut got, mut buf, mut whole_host) = (Vec::new(), [0u8; 65536], false);
+                    let records = loop {
                         let (recs, _) = records(&got);
                         if recs.iter().map(|(_, p)| p.len()).sum::<usize>() >= hello_len - 5 {
                             break recs.len();
                         }
                         match s.read(&mut buf) {
                             Ok(0) | Err(_) => return,
-                            Ok(n) => got.extend_from_slice(&buf[..n]),
+                            Ok(n) => {
+                                whole_host |= buf[..n].windows(host.len()).any(|w| w == host.as_bytes());
+                                got.extend_from_slice(&buf[..n]);
+                            }
                         }
                     };
-                    let _ = tx.send(recs);
-                    if recs > 1 {
+                    whole_host |= how.reassembles && got.windows(host.len()).any(|w| w == host.as_bytes());
+                    let filtered = how.filter && whole_host;
+                    let accepted = !filtered && !(how.picky && records > 1);
+                    let _ = tx.send(Seen { records, accepted });
+                    if filtered {
+                        if how.silent {
+                            while matches!(s.read(&mut buf), Ok(n) if n > 0) {}
+                        }
+                        return;
+                    }
+                    if !accepted {
                         let _ = s.write_all(&DECODE_ERROR);
                         return;
                     }
                     let _ = s.write_all(&SERVER_HELLO);
-                    while matches!(s.read(&mut buf), Ok(n) if n > 0) {}
+                    while let Ok(n) = s.read(&mut buf) {
+                        if n == 0 || s.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
                 });
             }
         });
         (port, rx)
+    }
+
+    /// Open a tunnel to `host` through the proxy, send its ClientHello, and check
+    /// that the client sees the server's answer and that data then flows both ways.
+    fn tunnel(p: &FragProxy, host: &str, up_port: u16, hello: &[u8]) {
+        let mut c = TcpStream::connect(("127.0.0.1", p.port())).unwrap();
+        c.write_all(format!("CONNECT {host}:{up_port} HTTP/1.1\r\n\r\n").as_bytes()).unwrap();
+        assert!(reply_head(&mut c).starts_with("HTTP/1.1 200"));
+        c.write_all(hello).unwrap();
+        assert_eq!(read_exact_n(&mut c, SERVER_HELLO.len()), SERVER_HELLO, "client sees the server's answer");
+        c.write_all(b"after").unwrap();
+        assert_eq!(read_exact_n(&mut c, 5), b"after");
+    }
+
+    fn seen(rx: &mpsc::Receiver<Seen>) -> Vec<Seen> {
+        let mut out = Vec::new();
+        while let Ok(s) = rx.recv_timeout(Duration::from_millis(200)) {
+            out.push(s);
+        }
+        out
+    }
+
+    fn logging_proxy(strategy: Option<Strategy>) -> (FragProxy, Arc<Mutex<Vec<String>>>) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink = log.clone();
+        let p = FragProxy::start(0, local(), strategy, Arc::new(move |m| sink.lock().unwrap().push(m))).unwrap();
+        (p, log)
     }
 
     fn read_exact_n(c: &mut TcpStream, n: usize) -> Vec<u8> {
@@ -498,52 +583,80 @@ mod tests {
     }
 
     #[test]
-    fn tunnel_splits_the_client_hello_and_passes_the_rest() {
-        let (up_port, rx) = upstream();
+    fn unblocked_host_gets_the_hello_unsplit() {
+        let hello = sample_client_hello("www.xbox.com");
+        let (up_port, rx) = tls_server(hello.len(), "www.xbox.com", OPEN);
         let p = proxy(local(), Some(Strategy::sni()));
-        let mut c = TcpStream::connect(("127.0.0.1", p.port())).unwrap();
-        c.write_all(format!("CONNECT store.steampowered.com:{up_port} HTTP/1.1\r\n\r\n").as_bytes()).unwrap();
-        assert!(reply_head(&mut c).starts_with("HTTP/1.1 200"));
+        tunnel(&p, "www.xbox.com", up_port, &hello);
+        assert_eq!(seen(&rx), [Seen { records: 1, accepted: true }]);
+        assert_eq!(p.stats().fragmented, 0);
+        p.stop();
+    }
 
-        let hello = sample_client_hello("store.steampowered.com");
-        c.write_all(&hello).unwrap();
-        let (got, reads) = collect(&rx, |b| b.len() >= hello.len() + 5);
-        let (recs, _) = records(&got);
-        assert_eq!(recs.len(), 2, "ClientHello arrives as two records");
-        let payload: Vec<u8> = recs.into_iter().flat_map(|(_, p)| p).collect();
-        assert_eq!(payload, hello[5..]);
-        assert!(reads >= 2, "and in at least two TCP reads");
-        assert_eq!(p.stats().fragmented, 1);
+    const STEAM: &str = "store.steampowered.com";
+    const NO: Seen = Seen { records: 1, accepted: false };
 
-        c.write_all(b"after").unwrap();
-        collect(&rx, |b| b.ends_with(b"after"));
+    #[test]
+    fn blocked_host_gets_a_tcp_split_first_and_it_is_remembered() {
+        let hello = sample_client_hello(STEAM);
+        let (up_port, rx) = tls_server(hello.len(), STEAM, Server { filter: true, ..OPEN });
+        let (p, log) = logging_proxy(Some(Strategy::sni()));
+
+        tunnel(&p, STEAM, up_port, &hello);
+        assert_eq!(seen(&rx), [NO, Seen { records: 1, accepted: true }], "unsplit filtered, TCP split passes");
+        tunnel(&p, STEAM, up_port, &hello);
+        assert_eq!(seen(&rx), [Seen { records: 1, accepted: true }], "second time: straight to the TCP split");
+        assert_eq!(p.stats().fragmented, 2);
+        assert!(log.lock().unwrap().iter().any(|m| m.ends_with("using TCP split mid host name")));
         p.stop();
     }
 
     #[test]
-    fn server_that_rejects_a_record_split_gets_a_tcp_split_instead() {
-        let hello = sample_client_hello("id.plaync.com");
-        let (up_port, rx) = picky_upstream(hello.len());
-        let log = Arc::new(Mutex::new(Vec::<String>::new()));
-        let p = {
-            let log = log.clone();
-            FragProxy::start(0, local(), Some(Strategy::sni()), Arc::new(move |m| log.lock().unwrap().push(m))).unwrap()
-        };
+    fn a_filter_that_reassembles_tcp_needs_the_record_split() {
+        let hello = sample_client_hello(STEAM);
+        let filter = Server { filter: true, reassembles: true, ..OPEN };
+        let (up_port, rx) = tls_server(hello.len(), STEAM, filter);
+        let (p, log) = logging_proxy(Some(Strategy::sni()));
 
-        for round in 0..2 {
-            let mut c = TcpStream::connect(("127.0.0.1", p.port())).unwrap();
-            c.write_all(format!("CONNECT id.plaync.com:{up_port} HTTP/1.1\r\n\r\n").as_bytes()).unwrap();
-            assert!(reply_head(&mut c).starts_with("HTTP/1.1 200"));
-            c.write_all(&hello).unwrap();
-            assert_eq!(read_exact_n(&mut c, SERVER_HELLO.len()), SERVER_HELLO, "round {round}: client sees the server's answer, not the alert");
-            if round == 0 {
-                assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), 2, "first try: record split");
-            }
-            assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), 1, "round {round}: one record, split only across TCP");
-        }
-        assert!(rx.try_recv().is_err(), "the second connection went straight to the remembered split");
+        tunnel(&p, STEAM, up_port, &hello);
+        assert_eq!(seen(&rx), [NO, NO, Seen { records: 2, accepted: true }]);
+        tunnel(&p, STEAM, up_port, &hello);
+        assert_eq!(seen(&rx), [Seen { records: 2, accepted: true }]);
+        assert!(log.lock().unwrap().iter().any(|m| m.ends_with("using record split mid host name")));
+
+        p.set_strategy(Some(Strategy::sni()));
+        tunnel(&p, STEAM, up_port, &hello);
+        assert_eq!(seen(&rx).len(), 3, "changing the strategy forgets what was learned");
+        p.stop();
+    }
+
+    #[test]
+    fn a_filter_that_drops_silently_is_detected_by_timeout() {
+        let hello = sample_client_hello(STEAM);
+        let (up_port, rx) = tls_server(hello.len(), STEAM, Server { filter: true, silent: true, ..OPEN });
+        let (p, log) = logging_proxy(Some(Strategy::sni()));
+        tunnel(&p, STEAM, up_port, &hello);
+        assert_eq!(seen(&rx), [NO, Seen { records: 1, accepted: true }]);
+        assert!(log.lock().unwrap().iter().any(|m| m.contains("no split failed (no answer)")));
+        p.stop();
+    }
+
+    #[test]
+    fn when_every_plan_fails_the_client_gets_the_last_answer() {
+        let host = "id.plaync.com";
+        let hello = sample_client_hello(host);
+        let all = Server { filter: true, reassembles: true, picky: true, ..OPEN };
+        let (up_port, rx) = tls_server(hello.len(), host, all);
+        let (p, log) = logging_proxy(Some(Strategy::sni()));
+        let mut c = TcpStream::connect(("127.0.0.1", p.port())).unwrap();
+        c.write_all(format!("CONNECT {host}:{up_port} HTTP/1.1\r\n\r\n").as_bytes()).unwrap();
+        assert!(reply_head(&mut c).starts_with("HTTP/1.1 200"));
+        c.write_all(&hello).unwrap();
+        assert_eq!(read_exact_n(&mut c, DECODE_ERROR.len()), DECODE_ERROR, "the browser sees the server's alert");
+        assert_eq!(seen(&rx), [NO, NO, Seen { records: 2, accepted: false }]);
         let log = log.lock().unwrap().join("\n");
-        assert!(log.contains("rejected record split") && log.contains("using TCP split"), "{log}");
+        assert!(log.contains("record split mid host name failed (alert 50), giving up"), "{log}");
+        assert!(!log.contains("using"), "nothing remembered: {log}");
         p.stop();
     }
 

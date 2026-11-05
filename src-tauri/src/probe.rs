@@ -436,6 +436,51 @@ mod tests {
         }
     }
 
+    /// Live check of many sites through one proxy with the default split, opt-in:
+    /// `FUGAWRAP_HOSTS="a.com b.com" cargo test -- --ignored --nocapture live_sites`.
+    /// Each site connects twice: the second one uses whatever the first learned.
+    /// Certificates are validated, so a server that serves the wrong one fails.
+    #[test]
+    #[ignore]
+    fn live_sites_through_proxy() {
+        let hosts = std::env::var("FUGAWRAP_HOSTS").unwrap_or_else(|_| "store.steampowered.com id.plaync.com".into());
+        let resolver = Arc::new(doh::Resolver::new(Duration::from_secs(300)));
+        let log = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = log.clone();
+        let p = crate::proxy::FragProxy::start(
+            0,
+            Arc::new(move |h| resolver.resolve(h)),
+            Some(Strategy::sni()),
+            Arc::new(move |m| sink.lock().unwrap().push(m)),
+        )
+        .unwrap();
+        let port = p.port();
+        let threads: Vec<_> = hosts
+            .split_whitespace()
+            .map(|h| {
+                let h = h.to_string();
+                std::thread::spawn(move || {
+                    let r: Vec<String> = (0..2)
+                        .map(|_| {
+                            let o = proxy_probe(port, &h, Duration::from_secs(20));
+                            if o.ok { format!("ok {}ms", o.ms) } else { o.error.unwrap_or_default() }
+                        })
+                        .collect();
+                    (h, r)
+                })
+            })
+            .collect();
+        let mut failed = 0;
+        for t in threads {
+            let (h, r) = t.join().unwrap();
+            failed += r.iter().filter(|x| !x.starts_with("ok")).count();
+            println!("  {h:<26} {}", r.join(" | "));
+        }
+        println!("--- proxy log\n{}", log.lock().unwrap().join("\n"));
+        println!("--- {failed} failed handshakes");
+        p.stop();
+    }
+
     #[test]
     fn bogus_answers_are_flagged() {
         for ip in ["0.0.0.0", "127.0.0.1", "10.1.2.3", "192.168.1.1", "172.20.0.1", "169.254.1.1", "100.64.0.1"] {

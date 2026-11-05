@@ -82,7 +82,10 @@ function handle(channel, fn) {
 
 handle('settings:get', () => ({ settings, providers: dnsMode.PROVIDERS }));
 handle('settings:targets', (targets) => {
-  const clean = [...new Set(targets.map((t) => String(t).trim().toLowerCase()).filter((t) => /^[a-z0-9.-]+$/.test(t)))];
+  // Dotted DNS names only: single words ("bad", "host") can't be public sites.
+  const label = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+  const isHost = (t) => t.length <= 253 && t.split('.').length >= 2 && t.split('.').every((l) => label.test(l));
+  const clean = [...new Set(targets.map((t) => String(t).trim().toLowerCase()).filter(isHost))];
   if (!clean.length) throw new Error('Add at least one host name');
   return saveSettings({ targets: clean });
 });

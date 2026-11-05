@@ -59,12 +59,25 @@ pub fn clean_targets(targets: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for t in targets {
         let t = t.trim().to_ascii_lowercase();
-        let valid = !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
-        if valid && !out.contains(&t) {
+        if is_host_name(&t) && !out.contains(&t) {
             out.push(t);
         }
     }
     out
+}
+
+/// A dotted DNS name such as `store.steampowered.com`. Single words ("bad",
+/// "host") are rejected: they can't be public sites.
+pub fn is_host_name(s: &str) -> bool {
+    let labels: Vec<&str> = s.split('.').collect();
+    s.len() <= 253
+        && labels.len() >= 2
+        && labels.iter().all(|l| {
+            (1..=63).contains(&l.len())
+                && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+        })
 }
 
 #[cfg(test)]
@@ -75,6 +88,19 @@ mod tests {
     fn clean_targets_filters_and_dedupes() {
         let input = ["Store.SteamPowered.com ", "store.steampowered.com", "bad host", "", "a-b.c"].map(String::from);
         assert_eq!(clean_targets(&input), vec!["store.steampowered.com", "a-b.c"]);
+    }
+
+    #[test]
+    fn host_names_need_dotted_valid_labels() {
+        for ok in ["store.steampowered.com", "a-b.c", "www.cloudflare.com", "x1.y2"] {
+            assert!(is_host_name(ok), "{ok}");
+        }
+        let long_label = format!("{}.com", "a".repeat(64));
+        let too_long = format!("{}com", "a.".repeat(127)); // 257 characters
+        let bad = ["bad", "host", "", ".com", "a..b", "-a.com", "a-.com", "a_b.com", "a.b c", &long_label, &too_long];
+        for b in bad {
+            assert!(!is_host_name(b), "{b}");
+        }
     }
 
     #[test]
