@@ -3,8 +3,11 @@
 
 mod dnsmode;
 mod doh;
+#[cfg(target_os = "macos")]
+mod mac;
 mod probe;
 mod proxy;
+#[cfg(windows)]
 mod ps;
 mod settings;
 mod sysproxy;

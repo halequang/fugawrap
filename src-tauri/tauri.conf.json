@@ -25,12 +25,13 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": ["nsis", "app", "dmg"],
     "publisher": "FunGaming (fungamingvn)",
     "icon": ["../src/assets/icon.png", "../build/icon.ico"],
     "windows": {
       "webviewInstallMode": { "type": "downloadBootstrapper" },
       "nsis": { "installMode": "currentUser" }
-    }
+    },
+    "macOS": { "minimumSystemVersion": "11.0" }
   }
 }
