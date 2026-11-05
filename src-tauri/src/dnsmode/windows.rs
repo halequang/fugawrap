@@ -1,26 +1,12 @@
-//! DNS mode: switch the active adapter to a public resolver with DNS-over-HTTPS,
-//! and undo it. Changing DNS needs administrator rights (one UAC prompt per
-//! action); reading the current state does not. The script is shared with the
-//! Electron build.
+//! Windows: dns.ps1 (shared with the Electron build) sets the adapter's servers
+//! and registers DNS-over-HTTPS. One UAC prompt per change.
 
+use super::{DnsStatus, PROVIDERS};
 use crate::ps::{ps_quote, run_ps, run_ps_elevated};
-use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::path::PathBuf;
 
-const SCRIPT: &str = include_str!("../../src/scripts/dns.ps1");
-
-pub const PROVIDERS: [(&str, &str); 5] = [
-    ("google", "Google"),
-    ("opendns", "OpenDNS"),
-    ("adguard", "AdGuard"),
-    ("alibaba", "Alibaba"),
-    ("cloudflare", "Cloudflare"),
-];
-
-pub fn providers_json() -> Map<String, Value> {
-    PROVIDERS.iter().map(|(k, v)| (k.to_string(), Value::from(*v))).collect()
-}
+const SCRIPT: &str = include_str!("../../../src/scripts/dns.ps1");
 
 fn state_dir() -> PathBuf {
     PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into())).join("FugaWrap")
@@ -36,16 +22,6 @@ fn last_log_line() -> String {
         .ok()
         .and_then(|t| t.trim().lines().last().map(str::to_string))
         .unwrap_or_default()
-}
-
-#[derive(Serialize)]
-pub struct DnsStatus {
-    pub active: bool,
-    pub provider: Option<String>,
-    pub original: Option<Value>,
-    pub adapter: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub log: Option<String>,
 }
 
 fn current_adapter() -> Option<Value> {

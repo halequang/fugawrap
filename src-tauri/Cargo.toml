@@ -1,7 +1,7 @@
 [package]
 name = "fugawrap"
 version = "0.1.0"
-description = "Diagnose and work around DNS and SNI blocking on Windows"
+description = "Diagnose and work around DNS and SNI blocking on Windows and macOS"
 authors = ["FunGaming (fungamingvn)"]
 license = "MIT"
 edition = "2021"
@@ -25,6 +25,8 @@ webpki-roots = "1"
 # DNS-over-HTTPS lookups.
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 base64 = "0.22"
+
+[target.'cfg(windows)'.dependencies]
 winreg = "0.55"
 windows-sys = { version = "0.59", features = ["Win32_Networking_WinInet"] }
 

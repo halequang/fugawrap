@@ -2,7 +2,7 @@
 //!
 //! RevoltWarp does this in the kernel with WinDivert, which catches every app but
 //! needs a driver. A proxy needs nothing installed and covers every app that uses
-//! the Windows system proxy; apps that ignore it are not covered.
+//! the system proxy setting; apps that ignore it are not covered.
 
 use crate::tls::{describe, fragment, is_client_hello, record_length, write_chunks, Strategy, GAP};
 use serde::Serialize;
